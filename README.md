@@ -1,1 +1,2 @@
 # Jax_mv_Git
+基于OpenmvH7plus+stm32f103c8t6的二维自由度舵机云台实时追踪目标
