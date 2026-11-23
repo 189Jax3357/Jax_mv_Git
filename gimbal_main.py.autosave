@@ -1,0 +1,180 @@
+# 绿色色块追踪 + 双轴独立 PID + 串口发给 STM32 云台
+# 适配：OpenMV Cam H7 Plus / 固件 V5.0.1
+#
+# 特点：
+#   - X 轴（水平/左右）与 Y 轴（俯仰/上下）的 PID 参数完全独立，可分别调
+#   - 两轴各自有死区、积分限幅、角度比例、方向开关
+#   - 兼容 5.x 的 blob 属性/方法两种形式、画图元组/分开传参两种形式
+import sensor, image, time
+from machine import UART
+import math
+
+# =============== 可调参数 ===============
+# 绿色阈值（LAB 色彩空间）：L 亮度，A 绿-红，B 蓝-黄
+#   绿色特征：A 强负值（-128~-10），B 接近 0（可正可负）
+#   RGB565 里绿通道是 6 位精度，绿色通常最好识别
+# 光照一变就要重新取：IDE -> 工具 -> Machine Vision -> Threshold Editor
+green_threshold = (30, 100, -64, -8, -40, 30)
+
+# 参考（需要时可切换）：
+#   鲜绿/荧光绿  (30, 100, -64, -8, -40, 30)
+#   深绿灯/暗绿  (10, 70,  -80, -20, -30, 20)
+#   黄绿/草绿    (30, 100, -60, -15,  10, 60)
+
+# ---- X 轴：水平（左右）----
+KP_X = 0.8
+KI_X = 0.02
+KD_X = 0.20
+INT_LIMIT_X = 500          # 积分限幅
+DEAD_ZONE_X = 15            # 中心死区（像素），小于它不动作，防抖
+ANGLE_K_X = 1.8 / 15       # 像素误差 -> 角度 的比例系数（越小越灵敏）
+INVERT_X = False           # True = 该轴反向
+
+# ---- Y 轴：俯仰（上下）----
+KP_Y = 1.0                 # Y 轴通常惰性大，P 给大一点
+KI_Y = 0.1
+KD_Y = 0.25
+INT_LIMIT_Y = 500
+DEAD_ZONE_Y = 20
+ANGLE_K_Y = 1.8 / 66
+INVERT_Y = False
+
+UART_BAUD = 115200         # 与 STM32 一致
+HEADER = 0xFF
+FOOTER = 0xFE
+# =======================================
+
+sensor.reset()
+sensor.set_pixformat(sensor.RGB565)
+sensor.set_framesize(sensor.QVGA)
+sensor.skip_frames(time=2000)
+sensor.set_auto_gain(False)
+sensor.set_auto_whitebal(False)
+
+uart = UART(3, UART_BAUD)
+
+last_error_x = 0
+integral_x = 0
+last_error_y = 0
+integral_y = 0
+
+_draw_ok = True
+
+print("gimbal dual-PID start (tracking GREEN)")
+
+
+def _get(obj, name):
+    """兼容固件差异：5.x 里是属性，老固件里是方法"""
+    a = getattr(obj, name)
+    return a() if callable(a) else a
+
+
+def _safe_draw(img, rect, cx, cy):
+    """画图兼容层：失败不影响控制"""
+    global _draw_ok
+    if not _draw_ok:
+        return
+    try:
+        try:
+            img.draw_rectangle(rect)
+        except TypeError:
+            img.draw_rectangle(rect[0], rect[1], rect[2], rect[3])
+        try:
+            img.draw_cross(cx, cy)
+        except TypeError:
+            img.draw_cross((cx, cy))
+    except Exception:
+        _draw_ok = False
+
+
+def send_packet(x_byte, y_byte):
+    """0xFF | X | Y | 0xFE"""
+    xb = int(max(0, min(255, x_byte)))
+    yb = int(max(0, min(255, y_byte)))
+    uart.write(bytes([HEADER, xb, yb, FOOTER]))
+
+
+def find_max(blobs):
+    max_blob = None
+    max_size = 0
+    for blob in blobs:
+        size = _get(blob, "pixels")
+        if size > max_size:
+            max_blob = blob
+            max_size = size
+    return max_blob
+
+
+def pid_axis(error, last_error, integral, kp, ki, kd, int_limit, dead_zone):
+    """单轴 PID：带死区 + 积分限幅，返回 (输出, 新last_error, 新积分)"""
+    if abs(error) < dead_zone:
+        error = 0
+
+    integral += error
+    if integral > int_limit:
+        integral = int_limit
+    if integral < -int_limit:
+        integral = -int_limit
+
+    pro = kp * error
+    integral_term = ki * integral
+    der = kd * (error - last_error)
+
+    output = pro + integral_term + der
+    last_error = error
+    return output, last_error, integral
+
+
+def angle_to_byte(deg, invert):
+    """±90° -> 0~255；invert=True 时反向"""
+    v = int((deg + 90) * 255 / 180)
+    if v < 0:
+        v = 0
+    if v > 255:
+        v = 255
+    if invert:
+        v = 255 - v
+    return v
+
+
+while True:
+    img = sensor.snapshot()
+
+    center_x = img.width() // 2
+    center_y = img.height() // 2
+
+    blobs = img.find_blobs([green_threshold],
+                           pixels_threshold=80,
+                           area_threshold=80,
+                           merge=True)
+
+    if blobs:
+        max_blob = find_max(blobs)
+        if max_blob is not None:
+            rect = _get(max_blob, "rect")
+            cx = _get(max_blob, "cx")
+            cy = _get(max_blob, "cy")
+
+            _safe_draw(img, rect, cx, cy)
+
+            error_x = center_x - cx          # 右偏为负
+            error_y = center_y - cy          # 下偏为负
+
+            out_x, last_error_x, integral_x = pid_axis(
+                error_x, last_error_x, integral_x, KP_X, KI_X, KD_X, INT_LIMIT_X, DEAD_ZONE_X)
+            out_y, last_error_y, integral_y = pid_axis(
+                error_y, last_error_y, integral_y, KP_Y, KI_Y, KD_Y, INT_LIMIT_Y, DEAD_ZONE_Y)
+
+            angle_x = math.atan2(out_x * ANGLE_K_X, 15) * 180 / math.pi
+            angle_y = math.atan2(out_y * ANGLE_K_Y, 15) * 180 / math.pi
+
+            bx = angle_to_byte(angle_x, INVERT_X)
+            by = angle_to_byte(angle_y, INVERT_Y)
+
+            send_packet(bx, by)
+
+            print("ex=%d ey=%d | out=(%.1f,%.1f) ang=(%.1f,%.1f) byte=(%d,%d)" %
+                  (error_x, error_y, out_x, out_y, angle_x, angle_y, bx, by))
+    else:
+        send_packet(128, 128)
+        print("not found")
